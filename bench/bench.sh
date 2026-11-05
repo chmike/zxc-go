@@ -88,9 +88,16 @@ bin=$work/bin
 mkdir -p "$bin"
 
 # The binaries.
-echo "building cbench and unzxc ..."
+# cbench follows the API of the library: decompression contexts after
+# v0.15.0, an options struct before.
+api=
+if grep -q zxc_dctx_set_param "$zxc_dir"/include/*.h; then
+	api=-DZXC_DCTX_API
+fi
+cbench=$bin/cbench-$("$GO" env GOARCH)
+echo "building $(basename "$cbench") and unzxc ..."
 # shellcheck disable=SC2086 # CFLAGS holds several flags
-"$CC" $CFLAGS -I"$zxc_dir/include" "$repo/bench/cbench.c" "$lib" -lpthread -lm -o "$bin/cbench"
+"$CC" $CFLAGS $api -I"$zxc_dir/include" "$repo/bench/cbench.c" "$lib" -lpthread -lm -o "$cbench"
 (cd "$repo" && "$GO" build -o "$bin/unzxc" ./cmd/unzxc)
 (cd "$repo" && "$GO" build -tags purego -o "$bin/unzxc-purego" ./cmd/unzxc)
 
@@ -168,10 +175,10 @@ for l in $levels; do
 	a=$arch/corpus.l$l.zxc
 	echo "measuring level $l ..."
 	ratio=$(awk -v a="$n" -v b="$(wc -c <"$a" | tr -d ' ')" 'BEGIN { printf "%.3f", a / b }')
-	c0=$(mbs "$bin/cbench" "$a" 0 "$seconds")
+	c0=$(mbs "$cbench" "$a" 0 "$seconds")
 	g0=$(mbs "$bin/unzxc" -bench "${seconds}s" -T 1 -skip-checksums "$a")
 	p0=$(mbs "$bin/unzxc-purego" -bench "${seconds}s" -T 1 -skip-checksums "$a")
-	c1=$(mbs "$bin/cbench" "$a" 1 "$seconds")
+	c1=$(mbs "$cbench" "$a" 1 "$seconds")
 	g1=$(mbs "$bin/unzxc" -bench "${seconds}s" -T 1 "$a")
 	p1=$(mbs "$bin/unzxc-purego" -bench "${seconds}s" -T 1 "$a")
 	rows_off="$rows_off| $l | $ratio | $c0 | $g0 | $(pct "$g0" "$c0") | $p0 | $(pct "$p0" "$c0") |

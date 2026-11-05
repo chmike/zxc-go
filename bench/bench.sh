@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# bench.sh: single-thread decompression benchmark of zxc-go against the
-# reference C library, at every level, with and without checksum
-# verification, for the default Go build (assembly) and -tags purego.
+# bench.sh: single-thread benchmark of zxc-go against the reference C
+# library, at every level: decompression with and without checksum
+# verification, and compression, for the default Go build (assembly) and
+# -tags purego.
 #
 # Usage:
-#   bench/bench.sh [-s seconds] [-l "levels"] [-w workdir] ZXC_DIR [ZXC_BUILD_DIR]
+#   bench/bench.sh [-s seconds] [-l "levels"] [-m d|c] [-w workdir] ZXC_DIR [ZXC_BUILD_DIR]
 #
 #   ZXC_DIR        source tree of the C library (https://github.com/hellobertrand/zxc):
 #                  its headers are taken from ZXC_DIR/include
@@ -14,6 +15,8 @@
 #                    cmake --build ZXC_DIR/build -j
 #   -s seconds     duration of each measurement (default 5)
 #   -l "levels"    levels to measure (default "1 2 3 4 5 6 7")
+#   -m d|c         measure decompression only (d) or compression only (c);
+#                  both by default
 #   -w workdir     where the corpus, archives, binaries and results go
 #                  (default ./zxcbench)
 #
@@ -27,7 +30,11 @@
 # directory named after its version, so that several versions of the C
 # library can be measured on the same corpus. Each throughput is the best
 # of the runs made in the given time, in MB/s of decompressed output
-# (10^6 bytes), as zxc -b and lzbench report it.
+# (10^6 bytes), as zxc -b and lzbench report it. Compression is measured
+# with zxc -b and zxcgo -b, without checksums (their -b default), each run
+# taking at least one compression of the whole corpus, which at levels 6
+# and 7 lasts several seconds; zxc -b takes whole seconds, so -s is rounded
+# up for them.
 #
 # Written for bash 3.2 (macOS) and later.
 
@@ -35,6 +42,7 @@ set -eu
 
 seconds=5
 levels="1 2 3 4 5 6 7"
+mode=dc
 work=zxcbench
 
 usage() {
@@ -42,10 +50,11 @@ usage() {
 	exit 2
 }
 
-while getopts "s:l:w:h" opt; do
+while getopts "s:l:m:w:h" opt; do
 	case $opt in
 	s) seconds=$OPTARG ;;
 	l) levels=$OPTARG ;;
+	m) mode=$OPTARG ;;
 	w) work=$OPTARG ;;
 	*) usage ;;
 	esac
@@ -95,11 +104,13 @@ if grep -q zxc_dctx_set_param "$zxc_dir"/include/*.h; then
 	api=-DZXC_DCTX_API
 fi
 cbench=$bin/cbench-$("$GO" env GOARCH)
-echo "building $(basename "$cbench") and unzxc ..."
+echo "building $(basename "$cbench"), unzxc and zxcgo ..."
 # shellcheck disable=SC2086 # CFLAGS holds several flags
 "$CC" $CFLAGS $api -I"$zxc_dir/include" "$repo/bench/cbench.c" "$lib" -lpthread -lm -o "$cbench"
 (cd "$repo" && "$GO" build -o "$bin/unzxc" ./cmd/unzxc)
 (cd "$repo" && "$GO" build -tags purego -o "$bin/unzxc-purego" ./cmd/unzxc)
+(cd "$repo" && "$GO" build -o "$bin/zxcgo" ./cmd/zxcgo)
+(cd "$repo" && "$GO" build -tags purego -o "$bin/zxcgo-purego" ./cmd/zxcgo)
 
 # The corpus.
 corpus=$work/corpus.bin
@@ -137,6 +148,11 @@ mbs() {
 	"$@" | sed -n 's/.*decompress \([0-9.]*\) MB\/s.*/\1/p'
 }
 
+# One compression measurement: the Compress figure of zxc -b or zxcgo -b.
+cmbs() {
+	"$@" | sed -n 's/^Compress *: *\([0-9.]*\) MB\/s.*/\1/p'
+}
+
 pct() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f %%", 100 * a / b }'; }
 
 cpu() {
@@ -169,9 +185,22 @@ table() { # title, then the rows
 	} >>"$out"
 }
 
+# zxc -b takes whole seconds, 1 at least.
+csec=$(awk -v s="$seconds" 'BEGIN { c = int(s); if (c < s) c++; if (c < 1) c = 1; print c }')
 rows_off=
 rows_on=
+rows_comp=
 for l in $levels; do
+	case $mode in *c*)
+		echo "measuring compression at level $l ..."
+		cc=$(cmbs "$zxc" -b"$csec" -"$l" -T1 "$corpus")
+		gc=$(cmbs "$bin/zxcgo" -b "$csec" -"$l" -T 1 "$corpus")
+		pc=$(cmbs "$bin/zxcgo-purego" -b "$csec" -"$l" -T 1 "$corpus")
+		rows_comp="$rows_comp| $l | $cc | $gc | $(pct "$gc" "$cc") | $pc | $(pct "$pc" "$cc") |
+"
+		;;
+	esac
+	case $mode in *d*) ;; *) continue ;; esac
 	a=$arch/corpus.l$l.zxc
 	echo "measuring level $l ..."
 	ratio=$(awk -v a="$n" -v b="$(wc -c <"$a" | tr -d ' ')" 'BEGIN { printf "%.3f", a / b }')
@@ -186,8 +215,20 @@ for l in $levels; do
 	rows_on="$rows_on| $l | $ratio | $c1 | $g1 | $(pct "$g1" "$c1") | $p1 | $(pct "$p1" "$c1") |
 "
 done
-printf '%s' "$rows_off" | table "Checksums not verified"
-printf '%s' "$rows_on" | table "Checksums verified"
+if [ -n "$rows_off" ]; then
+	printf '%s' "$rows_off" | table "Decompression, checksums not verified"
+	printf '%s' "$rows_on" | table "Decompression, checksums verified"
+fi
+if [ -n "$rows_comp" ]; then
+	{
+		echo "## Compression"
+		echo
+		echo "| Level | C | Go | Go / C | Go purego | purego / C |"
+		echo "|---|---|---|---|---|---|"
+		printf '%s' "$rows_comp"
+		echo
+	} >>"$out"
+fi
 
 echo
 cat "$out"

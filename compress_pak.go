@@ -26,6 +26,10 @@ func (e *encoder) appendPAK(dst, src []byte, start int) ([]byte, bool) {
 	m.newBlock()
 	m.seedDict(src, start, e.level >= 3)
 
+	if !e.noAsm && e.pakParseFast(src, start, &p) {
+		return e.appendPAKBlock(dst), true
+	}
+
 	iend := len(src)
 	ip, anchor := start, start
 	searchLimit := iend - lzSearchMargin
@@ -65,9 +69,13 @@ func (e *encoder) appendPAK(dst, src []byte, start int) ([]byte, bool) {
 	if !ok {
 		return dst, false
 	}
-	lits = append(lits, src[anchor:]...)
-	e.lits = lits
+	e.lits = append(lits, src[anchor:]...)
+	return e.appendPAKBlock(dst), true
+}
 
+// appendPAKBlock appends the PAK block of the encoder's streams.
+func (e *encoder) appendPAKBlock(dst []byte) []byte {
+	lits, seqs, extras := e.lits, e.seqs, e.extras
 	// [header 8][sub-header 12][literals][sequence words][extras][padding]
 	// The padding makes the sections behind the literals span 32 bytes at
 	// least, for the decoder's wide literal copies.
@@ -85,5 +93,5 @@ func (e *encoder) appendPAK(dst, src []byte, start int) ([]byte, bool) {
 	}
 	dst = append(dst, extras...)
 	dst = append(dst, make([]byte, pad)...)
-	return dst, true
+	return dst
 }

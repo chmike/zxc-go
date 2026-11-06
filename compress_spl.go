@@ -1,6 +1,9 @@
 package zxc
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math/bits"
+)
 
 // SPL block encoder (§ 5.2), levels 3 to 5: zxc_encode_block_glo of the
 // reference library with its lazy parser, its match splitting and its
@@ -58,7 +61,7 @@ func (e *encoder) appendSPL(dst, src []byte, start int) ([]byte, bool) {
 	litSize := len(lits)
 	bestJ := len(lits)
 	if len(lits) > 0 {
-		if rs := rleSize(lits); rs+len(lits)*premium>>8 < bestJ {
+		if rs := e.rleSize(lits); rs+len(lits)*premium>>8 < bestJ {
 			encLit, litSize, bestJ = encRLE, rs, rs+len(lits)*premium>>8
 		}
 	}
@@ -140,7 +143,7 @@ func (e *encoder) appendSPL(dst, src []byte, start int) ([]byte, bool) {
 	}
 	switch encLit {
 	case encRLE:
-		dst = appendRLE(dst, lits)
+		dst = e.appendRLE(dst, lits)
 	case encHuffman:
 		dst = appendPivCo(dst, lits, &litFreq, &litLen, litTree, true)
 	case encHuffmanDict:
@@ -171,6 +174,11 @@ func (e *encoder) appendSPL(dst, src []byte, start int) ([]byte, bool) {
 // the greedy parser and its lazy probes (levels 3 to 5), and returns the
 // largest offset minus 1, or false when a length cannot be coded.
 func (e *encoder) lazyParse(src []byte, start int, p *lzParams) (uint16, bool) {
+	if !e.noAsm {
+		if maxOff, ok := e.splParseFast(src, start, p); ok {
+			return maxOff, true
+		}
+	}
 	m := &e.m
 	iend := len(src)
 	ip, anchor := start, start
@@ -262,6 +270,19 @@ func rleSize(lits []byte) int {
 // rleCopyEnd returns where the copy that reaches position i of lits ends:
 // at the next run of rleMinRun equal bytes, or at the end.
 func rleCopyEnd(lits []byte, i int) int {
+	// 8 bytes at a time: x has a zero byte j where bytes j and j+1 are
+	// equal, z marks them exactly, and m the starts j <= 4 of 3 zero bytes
+	// in a row, that is of 4 equal bytes, all within the word.
+	const lo7 = 0x7F7F7F7F7F7F7F7F
+	for i+8 <= len(lits) {
+		w := load64(lits, i)
+		x := w ^ w>>8
+		z := ^((x&lo7 + lo7) | x | lo7)
+		if m := z & (z >> 8) & (z >> 16) & 0x8080808080; m != 0 {
+			return i + bits.TrailingZeros64(m)>>3
+		}
+		i += 5
+	}
 	for i < len(lits) {
 		if i+3 < len(lits) && lits[i] == lits[i+1] && lits[i+1] == lits[i+2] && lits[i+2] == lits[i+3] {
 			break
@@ -314,21 +335,30 @@ func (e *encoder) splitMatches(toks []byte, offs []uint16, extras []byte, limit 
 	}
 	side := grow(e.side, n)[:n]
 	e.side = side
+	if !e.noAsm {
+		if t, o, x, ok := e.splitFast(toks, offs, extras, limit); ok {
+			return t, o, x
+		}
+	}
 	var bad [1 << splSplitCtxBits]bool
 	if !splitAnalyze(toks, side, &bad) {
 		return toks, offs, extras
 	}
 
 	// 1. Mark the matches to split and drop their varints; the other extras
-	// move down.
+	// move down. The encoder wrote the varints: their lengths need no
+	// checks.
 	r, w, extra := 0, 0, 0
-	for i := range n {
-		t := toks[i]
+	side = side[:n]
+	for i, t := range toks {
 		isBad := bad[side[i]]
 		side[i] = 0
 		if t>>4 == splTokenMask {
-			_, next, _ := readVarint(extras, r)
-			w += copy(extras[w:], extras[r:next])
+			next := r + varintLen(extras[r])
+			if w != r {
+				copy(extras[w:], extras[r:next])
+			}
+			w += next - r
 			r = next
 		}
 		if t&splTokenMask != splTokenMask {
@@ -340,7 +370,10 @@ func (e *encoder) splitMatches(toks []byte, offs []uint16, extras []byte, limit 
 			side[i] = byte(code)
 			extra += (code+splMaxInlineML+lzMinMatch-1)/splMaxInlineML - 1
 		} else {
-			w += copy(extras[w:], extras[r:next])
+			if w != r {
+				copy(extras[w:], extras[r:next])
+			}
+			w += next - r
 		}
 		r = next
 	}
@@ -390,15 +423,17 @@ func splitAnalyze(toks, side []byte, bad *[1 << splSplitCtxBits]bool) bool {
 	}
 	hmask := uint32(1)<<order - 1
 	var hist [2][1 << splSplitCtxBits]uint32
-	h, nEsc := uint32(0), 0
+	h, nEsc := uint8(0), 0
+	m8 := uint8(hmask)
+	side = side[:len(toks)]
 	for i, t := range toks {
-		esc := uint32(0)
+		esc := uint8(0)
 		if t&splTokenMask == splTokenMask {
 			esc = 1
 		}
-		side[i] = byte(h)
+		side[i] = h
 		hist[esc][h]++
-		h = (h<<1 | esc) & hmask
+		h = (h<<1 | esc) & m8
 		nEsc += int(esc)
 	}
 	errors, badEsc := 0, 0
@@ -411,4 +446,33 @@ func splitAnalyze(toks, side []byte, bad *[1 << splSplitCtxBits]bool) bool {
 		errors += min(n0, n1)
 	}
 	return badEsc != 0 && errors*100 >= splSplitMispredict*nEsc
+}
+
+// varintLen is the length of the prefix varint starting with byte b0 (§ 6).
+func varintLen(b0 byte) int {
+	switch {
+	case b0 < 0x80:
+		return 1
+	case b0 < 0xC0:
+		return 2
+	}
+	return 3
+}
+
+// rleSize and appendRLE of the encoder: the assembly ones where there are
+// some.
+func (e *encoder) rleSize(lits []byte) int {
+	if e.noAsm {
+		return rleSize(lits)
+	}
+	n, _ := rleFast(nil, lits, false)
+	return n
+}
+
+func (e *encoder) appendRLE(dst, lits []byte) []byte {
+	if e.noAsm {
+		return appendRLE(dst, lits)
+	}
+	_, dst = rleFast(dst, lits, true)
+	return dst
 }

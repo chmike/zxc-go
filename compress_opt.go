@@ -28,8 +28,6 @@ func (e *encoder) optimalParse(src []byte, start int, p *lzParams) (uint16, bool
 	}
 	pp := *p
 	pp.useLazy = false
-	m := &e.m
-	searchLimit := n - lzSearchMargin
 	litCost := e.huf.estimateLitBits(blk)
 
 	if cap(e.dp) < n+1 {
@@ -37,11 +35,62 @@ func (e *encoder) optimalParse(src []byte, start int, p *lzParams) (uint16, bool
 		e.parentLen = make([]uint16, n+1)
 		e.parentOff = make([]uint16, n+1)
 	}
-	dp, parentLen, parentOff := e.dp[:n+1], e.parentLen[:n+1], e.parentOff[:n+1]
+	e.dp, e.parentLen, e.parentOff = e.dp[:n+1], e.parentLen[:n+1], e.parentOff[:n+1]
+	dp, parentLen, parentOff := e.dp, e.parentLen, e.parentOff
 	dp[0] = 0
 	for i := 1; i <= n; i++ {
 		dp[i] = optInf
 	}
+	if e.noAsm || !e.optParseFast(src, start, &pp, litCost) {
+		e.optimalDP(src, start, &pp, litCost)
+	}
+
+	// Walk back from the end, recording the match ends, then emit forward.
+	ends := e.ends[:0]
+	for pos := n; pos > 0; {
+		if L := int(parentLen[pos]); L == 0 {
+			pos--
+		} else {
+			ends = append(ends, pos)
+			pos -= L
+		}
+	}
+	e.ends = ends
+	maxOff := uint16(0)
+	litStart := 0
+	ok := true
+	for i := len(ends) - 1; i >= 0; i-- {
+		pos := ends[i]
+		L := int(parentLen[pos])
+		o := parentOff[pos]
+		mStart := pos - L
+		ll, ml := mStart-litStart, L-lzMinMatch
+		lits = append(lits, blk[litStart:mStart]...)
+		toks = append(toks, byte(min(ll, splTokenMask)<<4|min(ml, splTokenMask)))
+		offs = append(offs, o)
+		maxOff = max(maxOff, o)
+		if ll >= splTokenMask {
+			extras, ok = appendVarint(extras, uint32(ll-splTokenMask))
+		}
+		if ok && ml >= splTokenMask {
+			extras, ok = appendVarint(extras, uint32(ml-splTokenMask))
+		}
+		if !ok {
+			return 0, false
+		}
+		litStart = pos
+	}
+	lits = append(lits, blk[litStart:]...)
+	return maxOff, true
+}
+
+// optimalDP runs the dynamic program of optimalParse over the block
+// src[start:], filling e.dp, e.parentLen and e.parentOff.
+func (e *encoder) optimalDP(src []byte, start int, pp *lzParams, litCost uint32) {
+	m := &e.m
+	n := len(src) - start
+	searchLimit := n - lzSearchMargin
+	dp, parentLen, parentOff := e.dp[:n+1], e.parentLen[:n+1], e.parentOff[:n+1]
 	relax := func(q, L int, nxt uint32, off uint16) {
 		if nxt < dp[q+L] {
 			dp[q+L] = nxt
@@ -65,7 +114,7 @@ func (e *encoder) optimalParse(src []byte, start int, p *lzParams) (uint16, bool
 			continue
 		}
 		ip := start + q
-		mt := m.findBestMatch(src, ip, len(src), start+searchLimit, ip, e.level, &pp, lastOff)
+		mt := m.findBestMatch(src, ip, len(src), start+searchLimit, ip, e.level, pp, lastOff)
 		if mt.ref < 0 {
 			continue
 		}
@@ -125,41 +174,4 @@ func (e *encoder) optimalParse(src []byte, start int, p *lzParams) (uint16, bool
 		}
 	}
 
-	// Walk back from the end, recording the match ends, then emit forward.
-	ends := e.ends[:0]
-	for pos := n; pos > 0; {
-		if L := int(parentLen[pos]); L == 0 {
-			pos--
-		} else {
-			ends = append(ends, pos)
-			pos -= L
-		}
-	}
-	e.ends = ends
-	maxOff := uint16(0)
-	litStart := 0
-	ok := true
-	for i := len(ends) - 1; i >= 0; i-- {
-		pos := ends[i]
-		L := int(parentLen[pos])
-		o := parentOff[pos]
-		mStart := pos - L
-		ll, ml := mStart-litStart, L-lzMinMatch
-		lits = append(lits, blk[litStart:mStart]...)
-		toks = append(toks, byte(min(ll, splTokenMask)<<4|min(ml, splTokenMask)))
-		offs = append(offs, o)
-		maxOff = max(maxOff, o)
-		if ll >= splTokenMask {
-			extras, ok = appendVarint(extras, uint32(ll-splTokenMask))
-		}
-		if ok && ml >= splTokenMask {
-			extras, ok = appendVarint(extras, uint32(ml-splTokenMask))
-		}
-		if !ok {
-			return 0, false
-		}
-		litStart = pos
-	}
-	lits = append(lits, blk[litStart:]...)
-	return maxOff, true
 }

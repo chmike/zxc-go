@@ -5,7 +5,7 @@
 # -tags purego.
 #
 # Usage:
-#   bench/bench.sh [-s seconds] [-l "levels"] [-m d|c] [-w workdir] ZXC_DIR [ZXC_BUILD_DIR]
+#   bench/bench.sh [-s seconds] [-l "levels"] [-m d|c] [-i file] [-w workdir] ZXC_DIR [ZXC_BUILD_DIR]
 #
 #   ZXC_DIR        source tree of the C library (https://github.com/hellobertrand/zxc):
 #                  its headers are taken from ZXC_DIR/include
@@ -17,6 +17,8 @@
 #   -l "levels"    levels to measure (default "1 2 3 4 5 6 7")
 #   -m d|c         measure decompression only (d) or compression only (c);
 #                  both by default
+#   -i file        measure this file instead of the corpus, for example
+#                  silesia.tar; its archives go to their own directory
 #   -w workdir     where the corpus, archives, binaries and results go
 #                  (default ./zxcbench)
 #
@@ -25,10 +27,12 @@
 #
 # The corpus, workdir/corpus.bin, is the first 100 MiB of a tar of the Go
 # source tree of the Go toolchain in use; it is made once and kept: delete
-# it to make a new one, which also deletes the archives made from it. The archives are made with the zxc CLI of the build
-# directory, with its default options (checksums on, 512 KiB blocks), in a
-# directory named after its version, so that several versions of the C
-# library can be measured on the same corpus. Each throughput is the best
+# it to make a new one, which also deletes the archives made from it. -i
+# measures another file instead, such as silesia.tar. The archives are made
+# with the zxc CLI of the build directory, with its default options
+# (checksums on, 512 KiB blocks), in a directory named after its version,
+# and after the file with -i, so that several versions of the C library
+# can be measured on the same input. Each throughput is the best
 # of the runs made in the given time, in MB/s of decompressed output
 # (10^6 bytes), as zxc -b and lzbench report it. Compression is measured
 # with zxc -b and zxcgo -b, without checksums (their -b default), each run
@@ -43,6 +47,7 @@ set -eu
 seconds=5
 levels="1 2 3 4 5 6 7"
 mode=dc
+input=
 work=zxcbench
 
 usage() {
@@ -50,11 +55,12 @@ usage() {
 	exit 2
 }
 
-while getopts "s:l:m:w:h" opt; do
+while getopts "s:l:m:i:w:h" opt; do
 	case $opt in
 	s) seconds=$OPTARG ;;
 	l) levels=$OPTARG ;;
 	m) mode=$OPTARG ;;
+	i) input=$OPTARG ;;
 	w) work=$OPTARG ;;
 	*) usage ;;
 	esac
@@ -112,10 +118,14 @@ echo "building $(basename "$cbench"), unzxc and zxcgo ..."
 (cd "$repo" && "$GO" build -o "$bin/zxcgo" ./cmd/zxcgo)
 (cd "$repo" && "$GO" build -tags purego -o "$bin/zxcgo-purego" ./cmd/zxcgo)
 
-# The corpus.
+# The corpus, or the file -i names.
 corpus=$work/corpus.bin
 corpus_size=104857600
-if [ ! -f "$corpus" ]; then
+if [ -n "$input" ]; then
+	[ -f "$input" ] || fail "no file $input"
+	corpus=$(abspath "$(dirname "$input")")/$(basename "$input")
+	corpus_size=
+elif [ ! -f "$corpus" ]; then
 	goroot=$("$GO" env GOROOT)
 	echo "making $corpus from $goroot/src ..."
 	rm -rf "$work"/archives-*
@@ -124,7 +134,7 @@ if [ ! -f "$corpus" ]; then
 	mv "$corpus.tmp" "$corpus"
 fi
 n=$(wc -c <"$corpus" | tr -d ' ')
-[ "$n" -eq $corpus_size ] || echo "note: $corpus holds $n bytes, not $corpus_size"
+[ -z "$corpus_size" ] || [ "$n" -eq "$corpus_size" ] || echo "note: $corpus holds $n bytes, not $corpus_size"
 
 # The archives, one directory per version of the zxc CLI.
 version=$("$zxc" -V 2>&1 | head -n 1)
@@ -134,6 +144,16 @@ if git -C "$zxc_dir" rev-parse --git-dir >/dev/null 2>&1; then
 	label=$(git -C "$zxc_dir" describe --always --dirty)
 fi
 arch=$work/archives-$label
+name=corpus
+if [ -n "$input" ]; then
+	# Archives of another file: a directory named after it too. A file of
+	# that name changed since gets new archives.
+	name=$(basename "$input" | tr -c 'A-Za-z0-9._\n-' _)
+	arch=$work/archives-$label-$name
+	if [ -d "$arch" ] && [ "$corpus" -nt "$arch" ]; then
+		rm -rf "$arch"
+	fi
+fi
 mkdir -p "$arch"
 for l in $levels; do
 	a=$arch/corpus.l$l.zxc
@@ -163,14 +183,14 @@ cpu() {
 }
 
 zxcgo=$(git -C "$repo" describe --always --dirty 2>/dev/null || echo "not a git checkout")
-out=$work/results-$label-$(date +%Y%m%d-%H%M%S).md
+out=$work/results-$label-$name-$(date +%Y%m%d-%H%M%S).md
 {
 	echo "# zxc-go benchmark, $(date '+%Y-%m-%d %H:%M')"
 	echo
 	echo "- machine: $(uname -sm), $(cpu)"
 	echo "- C: $version ($label), $("$CC" --version 2>&1 | head -n 1), cbench built with $CFLAGS"
 	echo "- Go: $("$GO" version), zxc-go $zxcgo"
-	echo "- corpus: $n bytes, best of ${seconds} s per figure, single thread, MB/s"
+	echo "- input: $(basename "$corpus"), $n bytes, best of ${seconds} s per figure, single thread, MB/s"
 	echo
 } >"$out"
 

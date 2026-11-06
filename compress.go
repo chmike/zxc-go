@@ -158,6 +158,7 @@ func compressBound(n, bs int, checksums, seekable bool) int {
 // encoded.
 type encoder struct {
 	config
+	noAsm  bool // tests: the Go parsers only
 	m      matcher
 	lits   []byte   // literals of the block
 	seqs   []uint32 // PAK sequence words

@@ -14,9 +14,10 @@
 // -1 to -7 set the level, 3 by default. -B sets the block size, a power of
 // 2 from 4K to 2M (suffixes K and M), 512K by default. Checksums are
 // written, and verified on decompression, unless -N; with -b, as with zxc
-// -b, only when -C asks for them. -S appends a seek table. -D gives the dictionary to compress with, or that the archive
-// was compressed with. -T sets the number of goroutines, 0 (the default)
-// for every CPU, 1 for a sequential run.
+// -b, only when -C asks for them. -S appends a seek table. -D gives the
+// dictionary to compress with, or that the archive was compressed with.
+// -T sets the number of goroutines, 0 (the default) for every CPU, 1 for a
+// sequential run.
 //
 // -b compresses the file in memory repeatedly for the given number of
 // seconds, then decompresses the archive likewise, checks that it gives
